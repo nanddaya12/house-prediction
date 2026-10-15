@@ -1,4 +1,12 @@
 import os
+from pathlib import Path
+import sys
+
+# Ensure repository root is in sys.path for direct imports
+BASE_DIR = Path(__file__).resolve().parents[1]
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -9,7 +17,12 @@ st.set_page_config(
     layout="wide",
 )
 
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+# Read API_URL from Streamlit secrets, environment variable, or fallback to local
+api_url_default = "http://127.0.0.1:8000"
+try:
+    API_URL = st.secrets.get("API_URL", os.getenv("API_URL", api_url_default)).rstrip("/")
+except Exception:
+    API_URL = os.getenv("API_URL", api_url_default).rstrip("/")
 
 # Preset profiles for quick testing
 PRESETS = {
@@ -59,10 +72,77 @@ PRESETS = {
 
 def check_backend_health() -> bool:
     try:
-        resp = requests.get(f"{API_URL}/health", timeout=3)
+        resp = requests.get(f"{API_URL}/health", timeout=2)
         return resp.ok
-    except requests.RequestException:
+    except Exception:
         return False
+
+
+def execute_prediction(payload: dict):
+    """Run prediction via FastAPI microservice if available, or fallback to in-process ML engine."""
+    if is_healthy:
+        try:
+            res = requests.post(f"{API_URL}/predict/", json=payload, timeout=15)
+            if res.ok:
+                return res.json(), None
+            return None, f"API error ({res.status_code}): {res.text}"
+        except requests.RequestException as exc:
+            return None, f"Network error connecting to API: {exc}"
+
+    # Fallback to in-process ML model for standalone cloud deployment
+    try:
+        from app.schemas.house import HouseFeatures
+        from app.services.prediction_service import predict_house_price
+
+        features = HouseFeatures(**payload)
+        data = predict_house_price(features)
+        return data, None
+    except Exception as exc:
+        return None, f"Embedded prediction engine error: {exc}"
+
+
+def fetch_history_records(limit: int = 100):
+    """Retrieve history via API or fallback directly to database."""
+    if is_healthy:
+        try:
+            h_resp = requests.get(f"{API_URL}/predict/history?limit={limit}", timeout=10)
+            if h_resp.ok:
+                data = h_resp.json()
+                return data.get("items", []), data.get("total", 0)
+        except Exception:
+            pass
+
+    # Direct database fallback
+    try:
+        from app.database.connection import SessionLocal
+        from app.services.prediction_service import get_prediction_history
+
+        db = SessionLocal()
+        try:
+            total, records = get_prediction_history(db, limit=limit)
+            items = [
+                {
+                    "id": r.id,
+                    "created_at": r.created_at,
+                    "MedInc": r.MedInc,
+                    "HouseAge": r.HouseAge,
+                    "AveRooms": r.AveRooms,
+                    "AveBedrms": r.AveBedrms,
+                    "Population": r.Population,
+                    "AveOccup": r.AveOccup,
+                    "Latitude": r.Latitude,
+                    "Longitude": r.Longitude,
+                    "predicted_value": r.predicted_value,
+                    "estimated_price_usd": r.estimated_price_usd,
+                    "status": r.status,
+                }
+                for r in records
+            ]
+            return items, total
+        finally:
+            db.close()
+    except Exception:
+        return [], 0
 
 
 # Header & Status
@@ -74,10 +154,11 @@ with col_h1:
 with col_h2:
     is_healthy = check_backend_health()
     if is_healthy:
-        st.success("🟢 API Connected", icon="✅")
+        st.success("🟢 API Connected", icon="⚡")
+        st.caption(f"Microservice: `{API_URL}`")
     else:
-        st.error("🔴 API Offline", icon="⚠️")
-        st.caption(f"Run backend at `{API_URL}`: `python -m uvicorn app.main:app --reload`")
+        st.info("🟢 Standalone Cloud Mode", icon="🚀")
+        st.caption("Embedded ML engine active")
 
 tab_predict, tab_history, tab_docs = st.tabs(["📊 Value Predictor", "📜 Prediction History", "ℹ️ Dataset Info"])
 
@@ -178,23 +259,18 @@ with tab_predict:
         }
 
         with st.spinner("Appraising property via ML inference engine..."):
-            try:
-                res = requests.post(f"{API_URL}/predict/", json=payload, timeout=15)
-                if res.ok:
-                    data = res.json()
-                    st.success("Appraisal completed and logged to database!")
-
-                    res_col1, res_col2, res_col3 = st.columns(3)
-                    with res_col1:
-                        st.metric("Estimated Price (USD)", f"${data['estimated_price_usd']:,.2f}")
-                    with res_col2:
-                        st.metric("Model Index ($100k Units)", f"{data['predicted_value']:.3f}")
-                    with res_col3:
-                        st.metric("Audit ID", f"#{data.get('prediction_id', 'N/A')}")
-                else:
-                    st.error(f"Prediction failed ({res.status_code}): {res.text}")
-            except requests.RequestException as exc:
-                st.error(f"Could not connect to API at {API_URL}: {exc}")
+            data, err = execute_prediction(payload)
+            if err:
+                st.error(f"Prediction failed: {err}")
+            else:
+                st.success("Appraisal completed and logged!")
+                res_col1, res_col2, res_col3 = st.columns(3)
+                with res_col1:
+                    st.metric("Estimated Price (USD)", f"${data['estimated_price_usd']:,.2f}")
+                with res_col2:
+                    st.metric("Model Index ($100k Units)", f"{data['predicted_value']:.3f}")
+                with res_col3:
+                    st.metric("Audit ID", f"#{data.get('prediction_id', 'N/A')}")
 
 with tab_history:
     st.subheader("Historical Prediction Audits")
@@ -203,56 +279,45 @@ with tab_history:
         if st.button("🔄 Refresh History", use_container_width=True):
             st.rerun()
 
-    try:
-        h_resp = requests.get(f"{API_URL}/predict/history?limit=100", timeout=10)
-        if h_resp.ok:
-            h_data = h_resp.json()
-            items = h_data.get("items", [])
-            total = h_data.get("total", 0)
+    items, total = fetch_history_records(limit=100)
+    if items:
+        df_history = pd.DataFrame(items)
+        df_history["formatted_price"] = df_history["estimated_price_usd"].apply(
+            lambda x: f"${x:,.2f}"
+        )
 
-            if items:
-                df_history = pd.DataFrame(items)
-                # Format price column
-                df_history["formatted_price"] = df_history["estimated_price_usd"].apply(
-                    lambda x: f"${x:,.2f}"
-                )
+        metric_c1, metric_c2, metric_c3 = st.columns(3)
+        metric_c1.metric("Total Predictions Saved", total)
+        metric_c2.metric("Average Price", f"${df_history['estimated_price_usd'].mean():,.2f}")
+        metric_c3.metric(
+            "Latest Appraisal",
+            f"${df_history.iloc[0]['estimated_price_usd']:,.2f}" if len(df_history) else "N/A",
+        )
 
-                metric_c1, metric_c2, metric_c3 = st.columns(3)
-                metric_c1.metric("Total Predictions Saved", total)
-                metric_c2.metric("Average Price", f"${df_history['estimated_price_usd'].mean():,.2f}")
-                metric_c3.metric(
-                    "Latest Appraisal",
-                    f"${df_history.iloc[0]['estimated_price_usd']:,.2f}" if len(df_history) else "N/A",
-                )
+        display_cols = [
+            "id",
+            "created_at",
+            "formatted_price",
+            "predicted_value",
+            "MedInc",
+            "HouseAge",
+            "AveRooms",
+            "Population",
+            "Latitude",
+            "Longitude",
+        ]
+        available_cols = [c for c in display_cols if c in df_history.columns]
+        st.dataframe(df_history[available_cols], use_container_width=True)
 
-                display_cols = [
-                    "id",
-                    "created_at",
-                    "formatted_price",
-                    "predicted_value",
-                    "MedInc",
-                    "HouseAge",
-                    "AveRooms",
-                    "Population",
-                    "Latitude",
-                    "Longitude",
-                ]
-                available_cols = [c for c in display_cols if c in df_history.columns]
-                st.dataframe(df_history[available_cols], use_container_width=True)
-
-                csv = df_history.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "📥 Export History to CSV",
-                    data=csv,
-                    file_name="california_house_predictions.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.info("No predictions recorded yet. Run a prediction from the first tab!")
-        else:
-            st.warning(f"Could not retrieve history: {h_resp.status_code}")
-    except requests.RequestException as exc:
-        st.warning(f"Backend unreachable to fetch history: {exc}")
+        csv = df_history.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Export History to CSV",
+            data=csv,
+            file_name="california_house_predictions.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No predictions recorded yet. Run a prediction from the first tab!")
 
 with tab_docs:
     st.subheader("About the California Housing Model")
