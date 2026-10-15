@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+ENV/
+env/
+
+# Databases
+*.db
+*.sqlite3
+
+# Environment variables
+.env
+.env.local
+
+# ML Models & Checkpoints (large binary files)
+# app/models/*.pkl
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Streamlit
+.streamlit/
